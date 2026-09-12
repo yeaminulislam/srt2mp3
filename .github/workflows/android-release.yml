@@ -1,0 +1,143 @@
+name: Android Build & Release
+
+on:
+  push:
+    branches: [ "main", "arena/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create/update the GitHub release and attach the APK"
+        type: boolean
+        default: false
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build signed release APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure Android SDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "build-tools;36.0.0" > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36.1" > /dev/null 2>&1 || true
+
+      - name: Build release APK (signed)
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: 9r0W9dLof3Ky9TTrA5Is
+          KEY_PASSWORD: 9r0W9dLof3Ky9TTrA5Is
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew assembleRelease --stacktrace 2>&1 | tee build-log.txt
+
+      - name: Show build log tail on failure
+        if: failure()
+        run: |
+          {
+            echo "## Build log (last 150 lines)"
+            echo
+            echo '```'
+            tail -n 150 build-log.txt 2>/dev/null || echo "(no log file)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Gradle build failed - see the job summary for the log tail"
+
+      - name: Verify APK signature
+        run: |
+          APK="app/build/outputs/apk/release/app-release.apk"
+          ls -la "$APK"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs "$APK" | head -n 20
+
+      - name: Collect version info
+        id: info
+        run: |
+          VERSION="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          cp app/build/outputs/apk/release/app-release.apk "BalaSpeak-$VERSION-release.apk"
+          sha256sum "BalaSpeak-$VERSION-release.apk" > "BalaSpeak-$VERSION-release.apk.sha256"
+          ls -la BalaSpeak-*
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BalaSpeak-${{ steps.info.outputs.version }}-release-apk
+          path: |
+            BalaSpeak-*-release.apk
+            BalaSpeak-*-release.apk.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub release and attach APK
+        if: >-
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/arena/')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.info.outputs.version }}
+          TAG: ${{ steps.info.outputs.tag }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="$GITHUB_REF_NAME"; fi
+          SHA256="$(cut -d' ' -f1 "BalaSpeak-$VERSION-release.apk.sha256")"
+          NOTES="$(mktemp --suffix=.md)"
+          cat > "$NOTES" <<EOF
+          # BalaSpeak ${TAG}
+
+          AI-চালিত ভিডিও ডাবিং অ্যাপ — মাল্টি-ল্যাঙ্গুয়েজ সাবটাইটেল অনুবাদ এবং অডিও-ভিডিও অটো-সিঙ্ক।
+          High-speed AI video dubbing with multi-language subtitle translation and audio-video auto-sync.
+
+          ## ইনস্টল / Install
+
+          1. নিচের **BalaSpeak-${VERSION}-release.apk** ফাইলটি ডাউনলোড করুন
+          2. প্রয়োজনে ফোনে "Install unknown apps / অজানা অ্যাপ ইনস্টল" অনুমতি দিন
+          3. APK ইনস্টল করে চালু করুন
+
+          - Minimum Android: 7.0 (API 24) · Target: Android 16 (API 36)
+
+          ## ব্যবহারের আগে
+
+          অ্যাপ চালু করে Gemini API key-এর ঘরে আপনার নিজের Google AI Studio key বসিয়ে দিন — অনুবাদ ও TTS-এর জন্য এটি লাগবে।
+
+          ## Checksum (SHA-256)
+
+          ${SHA256}
+
+          অ্যাপটি release keystore দিয়ে সাইন করা — ভবিষ্যতের আপডেটও একই সিগনেচারে আসবে।
+          EOF
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists - updating assets"
+            gh release upload "$TAG" "BalaSpeak-$VERSION-release.apk" "BalaSpeak-$VERSION-release.apk.sha256" --clobber
+          else
+            gh release create "$TAG" \
+              "BalaSpeak-$VERSION-release.apk" \
+              "BalaSpeak-$VERSION-release.apk.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "BalaSpeak ${TAG}" \
+              --notes-file "$NOTES"
+          fi
+          gh release view "$TAG" --json name,tagName,assets --jq '{name, tagName, assets: [.assets[].name]}'
