@@ -1,0 +1,6 @@
+{
+  "name": "BalaSpeak",
+  "description": "High-speed AI video dubbing, multi-language subtitle translation and audio-video auto-synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
